@@ -8,29 +8,32 @@
  */
 'use strict';
 
+class MockMessageChannel {
+  constructor() {
+    this.port1 = jest.fn();
+    this.port2 = jest.fn();
+  }
+}
+
 describe('Scheduling UMD bundle', () => {
   beforeEach(() => {
     // Fool SECRET_INTERNALS object into including UMD forwarding methods.
     global.__UMD__ = true;
 
     jest.resetModules();
+    jest.unmock('scheduler');
+
+    global.MessageChannel = MockMessageChannel;
   });
 
-  function filterPrivateKeys(name) {
-    // TODO: Figure out how to forward priority levels.
-    return !name.startsWith('_') && !name.endsWith('Priority');
-  }
+  afterEach(() => {
+    global.MessageChannel = undefined;
+  });
 
   function validateForwardedAPIs(api, forwardedAPIs) {
-    const apiKeys = Object.keys(api)
-      .filter(filterPrivateKeys)
-      .sort();
+    const apiKeys = Object.keys(api).sort();
     forwardedAPIs.forEach(forwardedAPI => {
-      expect(
-        Object.keys(forwardedAPI)
-          .filter(filterPrivateKeys)
-          .sort(),
-      ).toEqual(apiKeys);
+      expect(Object.keys(forwardedAPI).sort()).toEqual(apiKeys);
     });
   }
 
@@ -39,26 +42,13 @@ describe('Scheduling UMD bundle', () => {
     const umdAPIDev = require('../../npm/umd/scheduler.development');
     const umdAPIProd = require('../../npm/umd/scheduler.production.min');
     const umdAPIProfiling = require('../../npm/umd/scheduler.profiling.min');
-    const secretAPI = require('react/src/ReactSharedInternals').default;
+    const secretAPI = require('react/src/forks/ReactSharedInternals.umd')
+      .default;
     validateForwardedAPIs(api, [
       umdAPIDev,
       umdAPIProd,
       umdAPIProfiling,
       secretAPI.Scheduler,
-    ]);
-  });
-
-  it('should define the same tracing API', () => {
-    const api = require('../../tracing');
-    const umdAPIDev = require('../../npm/umd/scheduler-tracing.development');
-    const umdAPIProd = require('../../npm/umd/scheduler-tracing.production.min');
-    const umdAPIProfiling = require('../../npm/umd/scheduler-tracing.profiling.min');
-    const secretAPI = require('react/src/ReactSharedInternals').default;
-    validateForwardedAPIs(api, [
-      umdAPIDev,
-      umdAPIProd,
-      umdAPIProfiling,
-      secretAPI.SchedulerTracing,
     ]);
   });
 });

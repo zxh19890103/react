@@ -14,6 +14,7 @@ const ReactDOMServerIntegrationUtils = require('./utils/ReactDOMServerIntegratio
 let React;
 let ReactDOM;
 let ReactDOMServer;
+let ReactTestUtils;
 
 function initModules() {
   // Reset warning cache.
@@ -21,11 +22,13 @@ function initModules() {
   React = require('react');
   ReactDOM = require('react-dom');
   ReactDOMServer = require('react-dom/server');
+  ReactTestUtils = require('react-dom/test-utils');
 
   // Make them available to the helpers.
   return {
     ReactDOM,
     ReactDOMServer,
+    ReactTestUtils,
   };
 }
 
@@ -37,9 +40,9 @@ describe('ReactDOMServerIntegration', () => {
   });
 
   describe('context', function() {
-    let PurpleContext, RedContext, Consumer;
+    let Context, PurpleContextProvider, RedContextProvider, Consumer;
     beforeEach(() => {
-      let Context = React.createContext('none');
+      Context = React.createContext('none');
 
       class Parent extends React.Component {
         render() {
@@ -51,8 +54,12 @@ describe('ReactDOMServerIntegration', () => {
         }
       }
       Consumer = Context.Consumer;
-      PurpleContext = props => <Parent text="purple">{props.children}</Parent>;
-      RedContext = props => <Parent text="red">{props.children}</Parent>;
+      PurpleContextProvider = props => (
+        <Parent text="purple">{props.children}</Parent>
+      );
+      RedContextProvider = props => (
+        <Parent text="red">{props.children}</Parent>
+      );
     });
 
     itRenders('class child with context', async render => {
@@ -67,9 +74,9 @@ describe('ReactDOMServerIntegration', () => {
       }
 
       const e = await render(
-        <PurpleContext>
+        <PurpleContextProvider>
           <ClassChildWithContext />
-        </PurpleContext>,
+        </PurpleContextProvider>,
       );
       expect(e.textContent).toBe('purple');
     });
@@ -80,9 +87,9 @@ describe('ReactDOMServerIntegration', () => {
       }
 
       const e = await render(
-        <PurpleContext>
+        <PurpleContextProvider>
           <FunctionChildWithContext />
-        </PurpleContext>,
+        </PurpleContextProvider>,
       );
       expect(e.textContent).toBe('purple');
     });
@@ -127,9 +134,9 @@ describe('ReactDOMServerIntegration', () => {
       const Child = props => <Grandchild />;
 
       const e = await render(
-        <PurpleContext>
+        <PurpleContextProvider>
           <Child />
-        </PurpleContext>,
+        </PurpleContextProvider>,
       );
       expect(e.textContent).toBe('purple');
     });
@@ -144,13 +151,52 @@ describe('ReactDOMServerIntegration', () => {
       };
 
       const e = await render(
-        <PurpleContext>
-          <RedContext>
+        <PurpleContextProvider>
+          <RedContextProvider>
             <Grandchild />
-          </RedContext>
-        </PurpleContext>,
+          </RedContextProvider>
+        </PurpleContextProvider>,
       );
       expect(e.textContent).toBe('red');
+    });
+
+    itRenders('readContext() in different components', async render => {
+      function readContext(Ctx) {
+        const dispatcher =
+          React.__SECRET_INTERNALS_DO_NOT_USE_OR_YOU_WILL_BE_FIRED
+            .ReactCurrentDispatcher.current;
+        return dispatcher.readContext(Ctx);
+      }
+
+      class Cls extends React.Component {
+        render() {
+          return readContext(Context);
+        }
+      }
+      function Fn() {
+        return readContext(Context);
+      }
+      const Memo = React.memo(() => {
+        return readContext(Context);
+      });
+      const FwdRef = React.forwardRef((props, ref) => {
+        return readContext(Context);
+      });
+
+      const e = await render(
+        <PurpleContextProvider>
+          <RedContextProvider>
+            <span>
+              <Fn />
+              <Cls />
+              <Memo />
+              <FwdRef />
+              <Consumer>{() => readContext(Context)}</Consumer>
+            </span>
+          </RedContextProvider>
+        </PurpleContextProvider>,
+      );
+      expect(e.textContent).toBe('redredredredred');
     });
 
     itRenders('multiple contexts', async render => {
@@ -224,12 +270,12 @@ describe('ReactDOMServerIntegration', () => {
                   </Theme.Provider>
                   <Language.Consumer>
                     {language => (
-                      <React.Fragment>
+                      <>
                         <Theme.Consumer>
                           {theme => <div id="theme3">{theme}</div>}
                         </Theme.Consumer>
                         <div id="language2">{language}</div>
-                      </React.Fragment>
+                      </>
                     )}
                   </Language.Consumer>
                 </Theme.Provider>
@@ -241,7 +287,7 @@ describe('ReactDOMServerIntegration', () => {
           </Language.Consumer>
         </div>
       );
-      let e = await render(<App />);
+      const e = await render(<App />);
       expect(e.querySelector('#theme1').textContent).toBe('dark');
       expect(e.querySelector('#theme2').textContent).toBe('light');
       expect(e.querySelector('#theme3').textContent).toBe('blue');
@@ -396,11 +442,11 @@ describe('ReactDOMServerIntegration', () => {
         </CurrentIndex.Provider>
       );
 
-      let streams = [];
+      const streams = [];
 
       // Test with more than 32 streams to test that growing the thread count
       // works properly.
-      let streamCount = 34;
+      const streamCount = 34;
 
       for (let i = 0; i < streamCount; i++) {
         streams[i] = ReactDOMServer.renderToNodeStream(
@@ -438,6 +484,99 @@ describe('ReactDOMServerIntegration', () => {
           '<header>' + i + '</header><footer>' + i + '</footer>',
         );
       }
+    });
+
+    // Regression test for https://github.com/facebook/react/issues/14705
+    it('does not pollute later renders when stream destroyed', () => {
+      const LoggedInUser = React.createContext('default');
+
+      const AppWithUser = user => (
+        <LoggedInUser.Provider value={user}>
+          <header>
+            <LoggedInUser.Consumer>{whoAmI => whoAmI}</LoggedInUser.Consumer>
+          </header>
+        </LoggedInUser.Provider>
+      );
+
+      const stream = ReactDOMServer.renderToNodeStream(
+        AppWithUser('Amy'),
+      ).setEncoding('utf8');
+
+      // This is an implementation detail because we test a memory leak
+      const {threadID} = stream.partialRenderer;
+
+      // Read enough to render Provider but not enough for it to be exited
+      stream._read(10);
+      expect(LoggedInUser[threadID]).toBe('Amy');
+
+      stream.destroy();
+
+      const AppWithUserNoProvider = () => (
+        <LoggedInUser.Consumer>{whoAmI => whoAmI}</LoggedInUser.Consumer>
+      );
+
+      const stream2 = ReactDOMServer.renderToNodeStream(
+        AppWithUserNoProvider(),
+      ).setEncoding('utf8');
+
+      // Sanity check to ensure 2nd render has same threadID as 1st render,
+      // otherwise this test is not testing what it's meant to
+      expect(stream2.partialRenderer.threadID).toBe(threadID);
+
+      const markup = stream2.read(Infinity);
+
+      expect(markup).toBe('default');
+    });
+
+    // Regression test for https://github.com/facebook/react/issues/14705
+    it('frees context value reference when stream destroyed', () => {
+      const LoggedInUser = React.createContext('default');
+
+      const AppWithUser = user => (
+        <LoggedInUser.Provider value={user}>
+          <header>
+            <LoggedInUser.Consumer>{whoAmI => whoAmI}</LoggedInUser.Consumer>
+          </header>
+        </LoggedInUser.Provider>
+      );
+
+      const stream = ReactDOMServer.renderToNodeStream(
+        AppWithUser('Amy'),
+      ).setEncoding('utf8');
+
+      // This is an implementation detail because we test a memory leak
+      const {threadID} = stream.partialRenderer;
+
+      // Read enough to render Provider but not enough for it to be exited
+      stream._read(10);
+      expect(LoggedInUser[threadID]).toBe('Amy');
+
+      stream.destroy();
+      expect(LoggedInUser[threadID]).toBe('default');
+    });
+
+    it('does not pollute sync renders after an error', () => {
+      const LoggedInUser = React.createContext('default');
+      const Crash = () => {
+        throw new Error('Boo!');
+      };
+      const AppWithUser = user => (
+        <LoggedInUser.Provider value={user}>
+          <LoggedInUser.Consumer>{whoAmI => whoAmI}</LoggedInUser.Consumer>
+          <Crash />
+        </LoggedInUser.Provider>
+      );
+
+      expect(() => {
+        ReactDOMServer.renderToString(AppWithUser('Casper'));
+      }).toThrow('Boo');
+
+      // Should not report a value from failed render
+      expect(
+        ReactDOMServer.renderToString(
+          <LoggedInUser.Consumer>{whoAmI => whoAmI}</LoggedInUser.Consumer>,
+        ),
+      ).toBe('default');
     });
   });
 });

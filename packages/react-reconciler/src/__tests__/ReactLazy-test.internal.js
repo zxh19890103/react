@@ -1,25 +1,36 @@
 let PropTypes;
 let React;
 let ReactTestRenderer;
+let Scheduler;
 let ReactFeatureFlags;
 let Suspense;
 let lazy;
+
+function normalizeCodeLocInfo(str) {
+  return (
+    str &&
+    str.replace(/\n +(?:at|in) ([\S]+)[^\n]*/g, function(m, name) {
+      return '\n    in ' + name + ' (at **)';
+    })
+  );
+}
 
 describe('ReactLazy', () => {
   beforeEach(() => {
     jest.resetModules();
     ReactFeatureFlags = require('shared/ReactFeatureFlags');
-    ReactFeatureFlags.debugRenderPhaseSideEffectsForStrictMode = false;
+
     ReactFeatureFlags.replayFailedUnitOfWorkWithInvokeGuardedCallback = false;
     PropTypes = require('prop-types');
     React = require('react');
     Suspense = React.Suspense;
     lazy = React.lazy;
     ReactTestRenderer = require('react-test-renderer');
+    Scheduler = require('scheduler');
   });
 
   function Text(props) {
-    ReactTestRenderer.unstable_yield(props.text);
+    Scheduler.unstable_yieldValue(props.text);
     return props.text;
   }
 
@@ -43,12 +54,12 @@ describe('ReactLazy', () => {
       },
     );
 
-    expect(root).toFlushAndYield(['Loading...']);
-    expect(root).toMatchRenderedOutput(null);
+    expect(Scheduler).toFlushAndYield(['Loading...']);
+    expect(root).not.toMatchRenderedOutput('Hi');
 
     await Promise.resolve();
 
-    expect(root).toFlushAndYield(['Hi']);
+    expect(Scheduler).toFlushAndYield(['Hi']);
     expect(root).toMatchRenderedOutput('Hi');
 
     // Should not suspend on update
@@ -57,8 +68,55 @@ describe('ReactLazy', () => {
         <LazyText text="Hi again" />
       </Suspense>,
     );
-    expect(root).toFlushAndYield(['Hi again']);
+    expect(Scheduler).toFlushAndYield(['Hi again']);
     expect(root).toMatchRenderedOutput('Hi again');
+  });
+
+  it('can resolve synchronously without suspending', async () => {
+    const LazyText = lazy(() => ({
+      then(cb) {
+        cb({default: Text});
+      },
+    }));
+
+    const root = ReactTestRenderer.create(
+      <Suspense fallback={<Text text="Loading..." />}>
+        <LazyText text="Hi" />
+      </Suspense>,
+    );
+
+    expect(Scheduler).toHaveYielded(['Hi']);
+    expect(root).toMatchRenderedOutput('Hi');
+  });
+
+  it('can reject synchronously without suspending', async () => {
+    const LazyText = lazy(() => ({
+      then(resolve, reject) {
+        reject(new Error('oh no'));
+      },
+    }));
+
+    class ErrorBoundary extends React.Component {
+      state = {};
+      static getDerivedStateFromError(error) {
+        return {message: error.message};
+      }
+      render() {
+        return this.state.message
+          ? `Error: ${this.state.message}`
+          : this.props.children;
+      }
+    }
+
+    const root = ReactTestRenderer.create(
+      <ErrorBoundary>
+        <Suspense fallback={<Text text="Loading..." />}>
+          <LazyText text="Hi" />
+        </Suspense>
+      </ErrorBoundary>,
+    );
+    expect(Scheduler).toHaveYielded([]);
+    expect(root).toMatchRenderedOutput('Error: oh no');
   });
 
   it('multiple lazy components', async () => {
@@ -70,8 +128,8 @@ describe('ReactLazy', () => {
       return <Text text="Bar" />;
     }
 
-    const promiseForFoo = delay(1000).then(() => fakeImport(Foo));
-    const promiseForBar = delay(2000).then(() => fakeImport(Bar));
+    const promiseForFoo = delay(100).then(() => fakeImport(Foo));
+    const promiseForBar = delay(500).then(() => fakeImport(Bar));
 
     const LazyFoo = lazy(() => promiseForFoo);
     const LazyBar = lazy(() => promiseForBar);
@@ -86,19 +144,19 @@ describe('ReactLazy', () => {
       },
     );
 
-    expect(root).toFlushAndYield(['Loading...']);
-    expect(root).toMatchRenderedOutput(null);
+    expect(Scheduler).toFlushAndYield(['Loading...']);
+    expect(root).not.toMatchRenderedOutput('FooBar');
 
-    jest.advanceTimersByTime(1000);
+    jest.advanceTimersByTime(100);
     await promiseForFoo;
 
-    expect(root).toFlushAndYield(['Foo', 'Loading...']);
-    expect(root).toMatchRenderedOutput(null);
+    expect(Scheduler).toFlushAndYield(['Foo']);
+    expect(root).not.toMatchRenderedOutput('FooBar');
 
-    jest.advanceTimersByTime(1000);
+    jest.advanceTimersByTime(500);
     await promiseForBar;
 
-    expect(root).toFlushAndYield(['Foo', 'Bar']);
+    expect(Scheduler).toFlushAndYield(['Foo', 'Bar']);
     expect(root).toMatchRenderedOutput('FooBar');
   });
 
@@ -115,18 +173,18 @@ describe('ReactLazy', () => {
         unstable_isConcurrent: true,
       },
     );
-    expect(root).toFlushAndYield(['Loading...']);
-    expect(root).toMatchRenderedOutput(null);
+    expect(Scheduler).toFlushAndYield(['Loading...']);
+    expect(root).not.toMatchRenderedOutput('Hi');
 
     await Promise.resolve();
 
+    expect(Scheduler).toFlushAndThrow('Element type is invalid');
     if (__DEV__) {
-      expect(console.error).toHaveBeenCalledTimes(1);
+      expect(console.error).toHaveBeenCalledTimes(3);
       expect(console.error.calls.argsFor(0)[0]).toContain(
         'Expected the result of a dynamic import() call',
       );
     }
-    expect(root).toFlushAndThrow('Element type is invalid');
   });
 
   it('throws if promise rejects', async () => {
@@ -143,23 +201,23 @@ describe('ReactLazy', () => {
       },
     );
 
-    expect(root).toFlushAndYield(['Loading...']);
-    expect(root).toMatchRenderedOutput(null);
+    expect(Scheduler).toFlushAndYield(['Loading...']);
+    expect(root).not.toMatchRenderedOutput('Hi');
 
     try {
       await Promise.resolve();
     } catch (e) {}
 
-    expect(root).toFlushAndThrow('Bad network');
+    expect(Scheduler).toFlushAndThrow('Bad network');
   });
 
   it('mount and reorder', async () => {
     class Child extends React.Component {
       componentDidMount() {
-        ReactTestRenderer.unstable_yield('Did mount: ' + this.props.label);
+        Scheduler.unstable_yieldValue('Did mount: ' + this.props.label);
       }
       componentDidUpdate() {
-        ReactTestRenderer.unstable_yield('Did update: ' + this.props.label);
+        Scheduler.unstable_yieldValue('Did update: ' + this.props.label);
       }
       render() {
         return <Text text={this.props.label} />;
@@ -189,18 +247,28 @@ describe('ReactLazy', () => {
       unstable_isConcurrent: true,
     });
 
-    expect(root).toFlushAndYield(['Loading...']);
-    expect(root).toMatchRenderedOutput(null);
+    expect(Scheduler).toFlushAndYield(['Loading...']);
+    expect(root).not.toMatchRenderedOutput('AB');
 
     await LazyChildA;
     await LazyChildB;
 
-    expect(root).toFlushAndYield(['A', 'B', 'Did mount: A', 'Did mount: B']);
+    expect(Scheduler).toFlushAndYield([
+      'A',
+      'B',
+      'Did mount: A',
+      'Did mount: B',
+    ]);
     expect(root).toMatchRenderedOutput('AB');
 
     // Swap the position of A and B
     root.update(<Parent swap={true} />);
-    expect(root).toFlushAndYield(['B', 'A', 'Did update: B', 'Did update: A']);
+    expect(Scheduler).toFlushAndYield([
+      'B',
+      'A',
+      'Did update: B',
+      'Did update: A',
+    ]);
     expect(root).toMatchRenderedOutput('BA');
   });
 
@@ -220,12 +288,12 @@ describe('ReactLazy', () => {
       },
     );
 
-    expect(root).toFlushAndYield(['Loading...']);
-    expect(root).toMatchRenderedOutput(null);
+    expect(Scheduler).toFlushAndYield(['Loading...']);
+    expect(root).not.toMatchRenderedOutput('Hi');
 
     await Promise.resolve();
 
-    expect(root).toFlushAndYield(['Hi']);
+    expect(Scheduler).toFlushAndYield(['Hi']);
     expect(root).toMatchRenderedOutput('Hi');
 
     T.defaultProps = {text: 'Hi again'};
@@ -234,18 +302,18 @@ describe('ReactLazy', () => {
         <LazyText />
       </Suspense>,
     );
-    expect(root).toFlushAndYield(['Hi again']);
+    expect(Scheduler).toFlushAndYield(['Hi again']);
     expect(root).toMatchRenderedOutput('Hi again');
   });
 
   it('resolves defaultProps without breaking memoization', async () => {
     function LazyImpl(props) {
-      ReactTestRenderer.unstable_yield('Lazy');
+      Scheduler.unstable_yieldValue('Lazy');
       return (
-        <React.Fragment>
+        <>
           <Text text={props.siblingText} />
           {props.children}
-        </React.Fragment>
+        </>
       );
     }
     LazyImpl.defaultProps = {siblingText: 'Sibling'};
@@ -270,18 +338,109 @@ describe('ReactLazy', () => {
         unstable_isConcurrent: true,
       },
     );
-    expect(root).toFlushAndYield(['Loading...']);
-    expect(root).toMatchRenderedOutput(null);
+    expect(Scheduler).toFlushAndYield(['Loading...']);
+    expect(root).not.toMatchRenderedOutput('SiblingA');
 
     await Promise.resolve();
 
-    expect(root).toFlushAndYield(['Lazy', 'Sibling', 'A']);
+    expect(Scheduler).toFlushAndYield(['Lazy', 'Sibling', 'A']);
     expect(root).toMatchRenderedOutput('SiblingA');
 
     // Lazy should not re-render
     stateful.current.setState({text: 'B'});
-    expect(root).toFlushAndYield(['B']);
+    expect(Scheduler).toFlushAndYield(['B']);
     expect(root).toMatchRenderedOutput('SiblingB');
+  });
+
+  it('resolves defaultProps without breaking bailout due to unchanged props and state, #17151', async () => {
+    class LazyImpl extends React.Component {
+      static defaultProps = {value: 0};
+
+      render() {
+        const text = `${this.props.label}: ${this.props.value}`;
+        return <Text text={text} />;
+      }
+    }
+
+    const Lazy = lazy(() => fakeImport(LazyImpl));
+
+    const instance1 = React.createRef(null);
+    const instance2 = React.createRef(null);
+
+    const root = ReactTestRenderer.create(
+      <>
+        <LazyImpl ref={instance1} label="Not lazy" />
+        <Suspense fallback={<Text text="Loading..." />}>
+          <Lazy ref={instance2} label="Lazy" />
+        </Suspense>
+      </>,
+      {
+        unstable_isConcurrent: true,
+      },
+    );
+    expect(Scheduler).toFlushAndYield(['Not lazy: 0', 'Loading...']);
+    expect(root).not.toMatchRenderedOutput('Not lazy: 0Lazy: 0');
+
+    await Promise.resolve();
+
+    expect(Scheduler).toFlushAndYield(['Lazy: 0']);
+    expect(root).toMatchRenderedOutput('Not lazy: 0Lazy: 0');
+
+    // Should bailout due to unchanged props and state
+    instance1.current.setState(null);
+    expect(Scheduler).toFlushAndYield([]);
+    expect(root).toMatchRenderedOutput('Not lazy: 0Lazy: 0');
+
+    // Should bailout due to unchanged props and state
+    instance2.current.setState(null);
+    expect(Scheduler).toFlushAndYield([]);
+    expect(root).toMatchRenderedOutput('Not lazy: 0Lazy: 0');
+  });
+
+  it('resolves defaultProps without breaking bailout in PureComponent, #17151', async () => {
+    class LazyImpl extends React.PureComponent {
+      static defaultProps = {value: 0};
+      state = {};
+
+      render() {
+        const text = `${this.props.label}: ${this.props.value}`;
+        return <Text text={text} />;
+      }
+    }
+
+    const Lazy = lazy(() => fakeImport(LazyImpl));
+
+    const instance1 = React.createRef(null);
+    const instance2 = React.createRef(null);
+
+    const root = ReactTestRenderer.create(
+      <>
+        <LazyImpl ref={instance1} label="Not lazy" />
+        <Suspense fallback={<Text text="Loading..." />}>
+          <Lazy ref={instance2} label="Lazy" />
+        </Suspense>
+      </>,
+      {
+        unstable_isConcurrent: true,
+      },
+    );
+    expect(Scheduler).toFlushAndYield(['Not lazy: 0', 'Loading...']);
+    expect(root).not.toMatchRenderedOutput('Not lazy: 0Lazy: 0');
+
+    await Promise.resolve();
+
+    expect(Scheduler).toFlushAndYield(['Lazy: 0']);
+    expect(root).toMatchRenderedOutput('Not lazy: 0Lazy: 0');
+
+    // Should bailout due to shallow equal props and state
+    instance1.current.setState({});
+    expect(Scheduler).toFlushAndYield([]);
+    expect(root).toMatchRenderedOutput('Not lazy: 0Lazy: 0');
+
+    // Should bailout due to shallow equal props and state
+    instance2.current.setState({});
+    expect(Scheduler).toFlushAndYield([]);
+    expect(root).toMatchRenderedOutput('Not lazy: 0Lazy: 0');
   });
 
   it('sets defaultProps for modern lifecycles', async () => {
@@ -290,7 +449,7 @@ describe('ReactLazy', () => {
       state = {};
 
       static getDerivedStateFromProps(props) {
-        ReactTestRenderer.unstable_yield(
+        Scheduler.unstable_yieldValue(
           `getDerivedStateFromProps: ${props.text}`,
         );
         return null;
@@ -298,36 +457,34 @@ describe('ReactLazy', () => {
 
       constructor(props) {
         super(props);
-        ReactTestRenderer.unstable_yield(`constructor: ${this.props.text}`);
+        Scheduler.unstable_yieldValue(`constructor: ${this.props.text}`);
       }
 
       componentDidMount() {
-        ReactTestRenderer.unstable_yield(
-          `componentDidMount: ${this.props.text}`,
-        );
+        Scheduler.unstable_yieldValue(`componentDidMount: ${this.props.text}`);
       }
 
       componentDidUpdate(prevProps) {
-        ReactTestRenderer.unstable_yield(
+        Scheduler.unstable_yieldValue(
           `componentDidUpdate: ${prevProps.text} -> ${this.props.text}`,
         );
       }
 
       componentWillUnmount() {
-        ReactTestRenderer.unstable_yield(
+        Scheduler.unstable_yieldValue(
           `componentWillUnmount: ${this.props.text}`,
         );
       }
 
       shouldComponentUpdate(nextProps) {
-        ReactTestRenderer.unstable_yield(
+        Scheduler.unstable_yieldValue(
           `shouldComponentUpdate: ${this.props.text} -> ${nextProps.text}`,
         );
         return true;
       }
 
       getSnapshotBeforeUpdate(prevProps) {
-        ReactTestRenderer.unstable_yield(
+        Scheduler.unstable_yieldValue(
           `getSnapshotBeforeUpdate: ${prevProps.text} -> ${this.props.text}`,
         );
         return null;
@@ -349,12 +506,12 @@ describe('ReactLazy', () => {
       },
     );
 
-    expect(root).toFlushAndYield(['Loading...']);
-    expect(root).toMatchRenderedOutput(null);
+    expect(Scheduler).toFlushAndYield(['Loading...']);
+    expect(root).not.toMatchRenderedOutput('A1');
 
     await Promise.resolve();
 
-    expect(root).toFlushAndYield([
+    expect(Scheduler).toFlushAndYield([
       'constructor: A',
       'getDerivedStateFromProps: A',
       'A1',
@@ -366,7 +523,7 @@ describe('ReactLazy', () => {
         <LazyClass num={2} />
       </Suspense>,
     );
-    expect(root).toFlushAndYield([
+    expect(Scheduler).toFlushAndYield([
       'getDerivedStateFromProps: A',
       'shouldComponentUpdate: A -> A',
       'A2',
@@ -380,7 +537,7 @@ describe('ReactLazy', () => {
         <LazyClass num={3} />
       </Suspense>,
     );
-    expect(root).toFlushAndYield([
+    expect(Scheduler).toFlushAndYield([
       'getDerivedStateFromProps: A',
       'shouldComponentUpdate: A -> A',
       'A3',
@@ -396,22 +553,20 @@ describe('ReactLazy', () => {
       state = {};
 
       UNSAFE_componentWillMount() {
-        ReactTestRenderer.unstable_yield(
+        Scheduler.unstable_yieldValue(
           `UNSAFE_componentWillMount: ${this.props.text}`,
         );
       }
 
       UNSAFE_componentWillUpdate(nextProps) {
-        ReactTestRenderer.unstable_yield(
+        Scheduler.unstable_yieldValue(
           `UNSAFE_componentWillUpdate: ${this.props.text} -> ${nextProps.text}`,
         );
       }
 
       UNSAFE_componentWillReceiveProps(nextProps) {
-        ReactTestRenderer.unstable_yield(
-          `UNSAFE_componentWillReceiveProps: ${this.props.text} -> ${
-            nextProps.text
-          }`,
+        Scheduler.unstable_yieldValue(
+          `UNSAFE_componentWillReceiveProps: ${this.props.text} -> ${nextProps.text}`,
         );
       }
 
@@ -428,25 +583,21 @@ describe('ReactLazy', () => {
       </Suspense>,
     );
 
-    expect(ReactTestRenderer).toHaveYielded(['Loading...']);
-    expect(root).toFlushAndYield([]);
+    expect(Scheduler).toHaveYielded(['Loading...']);
+    expect(Scheduler).toFlushAndYield([]);
     expect(root).toMatchRenderedOutput('Loading...');
 
     await Promise.resolve();
+
+    expect(Scheduler).toHaveYielded([]);
 
     root.update(
       <Suspense fallback={<Text text="Loading..." />}>
         <LazyClass num={2} />
       </Suspense>,
     );
-    expect(ReactTestRenderer).toHaveYielded([
-      'UNSAFE_componentWillMount: A',
-      'A1',
-      'UNSAFE_componentWillReceiveProps: A -> A',
-      'UNSAFE_componentWillUpdate: A -> A',
-      'A2',
-    ]);
-    expect(root).toFlushAndYield([]);
+
+    expect(Scheduler).toHaveYielded(['UNSAFE_componentWillMount: A', 'A2']);
     expect(root).toMatchRenderedOutput('A2');
 
     root.update(
@@ -454,25 +605,25 @@ describe('ReactLazy', () => {
         <LazyClass num={3} />
       </Suspense>,
     );
-    expect(ReactTestRenderer).toHaveYielded([
+    expect(Scheduler).toHaveYielded([
       'UNSAFE_componentWillReceiveProps: A -> A',
       'UNSAFE_componentWillUpdate: A -> A',
       'A3',
     ]);
-    expect(root).toFlushAndYield([]);
+    expect(Scheduler).toFlushAndYield([]);
     expect(root).toMatchRenderedOutput('A3');
   });
 
   it('resolves defaultProps on the outer wrapper but warns', async () => {
     function T(props) {
-      ReactTestRenderer.unstable_yield(props.inner + ' ' + props.outer);
+      Scheduler.unstable_yieldValue(props.inner + ' ' + props.outer);
       return props.inner + ' ' + props.outer;
     }
     T.defaultProps = {inner: 'Hi'};
     const LazyText = lazy(() => fakeImport(T));
     expect(() => {
       LazyText.defaultProps = {outer: 'Bye'};
-    }).toWarnDev(
+    }).toErrorDev(
       'React.lazy(...): It is not supported to assign `defaultProps` to ' +
         'a lazy component import. Either specify them where the component ' +
         'is defined, or create a wrapping component around it.',
@@ -488,11 +639,11 @@ describe('ReactLazy', () => {
       },
     );
 
-    expect(root).toFlushAndYield(['Loading...']);
-    expect(root).toMatchRenderedOutput(null);
+    expect(Scheduler).toFlushAndYield(['Loading...']);
+    expect(root).not.toMatchRenderedOutput('Hi Bye');
 
     await Promise.resolve();
-    expect(root).toFlushAndYield(['Hi Bye']);
+    expect(Scheduler).toFlushAndYield(['Hi Bye']);
     expect(root).toMatchRenderedOutput('Hi Bye');
 
     root.update(
@@ -500,7 +651,7 @@ describe('ReactLazy', () => {
         <LazyText outer="World" />
       </Suspense>,
     );
-    expect(root).toFlushAndYield(['Hi World']);
+    expect(Scheduler).toFlushAndYield(['Hi World']);
     expect(root).toMatchRenderedOutput('Hi World');
 
     root.update(
@@ -508,7 +659,7 @@ describe('ReactLazy', () => {
         <LazyText inner="Friends" />
       </Suspense>,
     );
-    expect(root).toFlushAndYield(['Friends Bye']);
+    expect(Scheduler).toFlushAndYield(['Friends Bye']);
     expect(root).toMatchRenderedOutput('Friends Bye');
   });
 
@@ -524,8 +675,7 @@ describe('ReactLazy', () => {
       },
     );
 
-    expect(root).toFlushAndYield(['Loading...']);
-    expect(root).toMatchRenderedOutput(null);
+    expect(Scheduler).toFlushAndYield(['Loading...']);
 
     await Promise.resolve();
     root.update(
@@ -533,9 +683,7 @@ describe('ReactLazy', () => {
         <BadLazy />
       </Suspense>,
     );
-    expect(() => {
-      root.unstable_flushAll();
-    }).toThrow(
+    expect(Scheduler).toFlushAndThrow(
       'Element type is invalid. Received a promise that resolves to: 42. ' +
         'Lazy element type must resolve to a class or function.',
     );
@@ -554,8 +702,8 @@ describe('ReactLazy', () => {
       },
     );
 
-    expect(root).toFlushAndYield(['Loading...']);
-    expect(root).toMatchRenderedOutput(null);
+    expect(Scheduler).toFlushAndYield(['Loading...']);
+    expect(root).not.toMatchRenderedOutput('Hello');
 
     await Promise.resolve();
     root.update(
@@ -563,9 +711,7 @@ describe('ReactLazy', () => {
         <Lazy2 text="Hello" />
       </Suspense>,
     );
-    expect(() => {
-      root.unstable_flushAll();
-    }).toThrow(
+    expect(Scheduler).toFlushAndThrow(
       'Element type is invalid. Received a promise that resolves to: [object Object]. ' +
         'Lazy element type must resolve to a class or function.' +
         (__DEV__
@@ -578,7 +724,7 @@ describe('ReactLazy', () => {
     const LazyText = lazy(() => fakeImport(Text));
     expect(() => {
       LazyText.propTypes = {hello: () => {}};
-    }).toWarnDev(
+    }).toErrorDev(
       'React.lazy(...): It is not supported to assign `propTypes` to ' +
         'a lazy component import. Either specify them where the component ' +
         'is defined, or create a wrapping component around it.',
@@ -590,7 +736,7 @@ describe('ReactLazy', () => {
     const LazyAdd = lazy(() => fakeImport(Add));
     expect(() => {
       LazyAdd.propTypes = {};
-    }).toWarnDev(
+    }).toErrorDev(
       'React.lazy(...): It is not supported to assign `propTypes` to ' +
         'a lazy component import. Either specify them where the component ' +
         'is defined, or create a wrapping component around it.',
@@ -606,16 +752,16 @@ describe('ReactLazy', () => {
       },
     );
 
-    expect(root).toFlushAndYield(['Loading...']);
-    expect(root).toMatchRenderedOutput(null);
+    expect(Scheduler).toFlushAndYield(['Loading...']);
+    expect(root).not.toMatchRenderedOutput('22');
 
     // Mount
     await Promise.resolve();
     expect(() => {
-      root.unstable_flushAll();
-    }).toWarnDev(
+      Scheduler.unstable_flushAll();
+    }).toErrorDev([
       'Invalid prop `inner` of type `string` supplied to `Add`, expected `number`.',
-    );
+    ]);
     expect(root).toMatchRenderedOutput('22');
 
     // Update
@@ -625,8 +771,8 @@ describe('ReactLazy', () => {
           <LazyAdd inner={false} outer={false} />
         </Suspense>,
       );
-      root.unstable_flushAll();
-    }).toWarnDev(
+      expect(Scheduler).toFlushWithoutYielding();
+    }).toErrorDev(
       'Invalid prop `inner` of type `boolean` supplied to `Add`, expected `number`.',
     );
     expect(root).toMatchRenderedOutput('0');
@@ -791,14 +937,14 @@ describe('ReactLazy', () => {
       },
     );
 
-    expect(root).toFlushAndYield(['Loading...']);
-    expect(root).toMatchRenderedOutput(null);
+    expect(Scheduler).toFlushAndYield(['Loading...']);
+    expect(root).not.toMatchRenderedOutput('Inner default text');
 
     // Mount
     await Promise.resolve();
     expect(() => {
-      root.unstable_flushAll();
-    }).toWarnDev(
+      expect(Scheduler).toFlushAndYield(['Inner default text']);
+    }).toErrorDev(
       'The prop `text` is marked as required in `T`, but its value is `undefined`',
     );
     expect(root).toMatchRenderedOutput('Inner default text');
@@ -810,8 +956,8 @@ describe('ReactLazy', () => {
           <LazyText text={null} />
         </Suspense>,
       );
-      root.unstable_flushAll();
-    }).toWarnDev(
+      expect(Scheduler).toFlushAndYield([null]);
+    }).toErrorDev(
       'The prop `text` is marked as required in `T`, but its value is `null`',
     );
     expect(root).toMatchRenderedOutput(null);
@@ -819,7 +965,7 @@ describe('ReactLazy', () => {
 
   it('includes lazy-loaded component in warning stack', async () => {
     const LazyFoo = lazy(() => {
-      ReactTestRenderer.unstable_yield('Started loading');
+      Scheduler.unstable_yieldValue('Started loading');
       const Foo = props => <div>{[<Text text="A" />, <Text text="B" />]}</div>;
       return fakeImport(Foo);
     });
@@ -833,14 +979,14 @@ describe('ReactLazy', () => {
       },
     );
 
-    expect(root).toFlushAndYield(['Started loading', 'Loading...']);
-    expect(root).toMatchRenderedOutput(null);
+    expect(Scheduler).toFlushAndYield(['Started loading', 'Loading...']);
+    expect(root).not.toMatchRenderedOutput(<div>AB</div>);
 
     await Promise.resolve();
 
     expect(() => {
-      expect(root).toFlushAndYield(['A', 'B']);
-    }).toWarnDev('    in Text (at **)\n' + '    in Foo (at **)');
+      expect(Scheduler).toFlushAndYield(['A', 'B']);
+    }).toErrorDev('    in Text (at **)\n' + '    in Foo (at **)');
     expect(root).toMatchRenderedOutput(<div>AB</div>);
   });
 
@@ -862,7 +1008,7 @@ describe('ReactLazy', () => {
       }
       return fakeImport(
         React.forwardRef((props, ref) => {
-          ReactTestRenderer.unstable_yield('forwardRef');
+          Scheduler.unstable_yieldValue('forwardRef');
           return <Bar ref={ref} />;
         }),
       );
@@ -879,13 +1025,13 @@ describe('ReactLazy', () => {
       },
     );
 
-    expect(root).toFlushAndYield(['Loading...']);
-    expect(root).toMatchRenderedOutput(null);
+    expect(Scheduler).toFlushAndYield(['Loading...']);
+    expect(root).not.toMatchRenderedOutput('FooBar');
     expect(ref.current).toBe(null);
 
     await Promise.resolve();
 
-    expect(root).toFlushAndYield(['Foo', 'forwardRef', 'Bar']);
+    expect(Scheduler).toFlushAndYield(['Foo', 'forwardRef', 'Bar']);
     expect(root).toMatchRenderedOutput('FooBar');
     expect(ref.current).not.toBe(null);
   });
@@ -907,12 +1053,12 @@ describe('ReactLazy', () => {
         unstable_isConcurrent: true,
       },
     );
-    expect(root).toFlushAndYield(['Loading...']);
-    expect(root).toMatchRenderedOutput(null);
+    expect(Scheduler).toFlushAndYield(['Loading...']);
+    expect(root).not.toMatchRenderedOutput('4');
 
     // Mount
     await Promise.resolve();
-    root.unstable_flushAll();
+    expect(Scheduler).toFlushWithoutYielding();
     expect(root).toMatchRenderedOutput('4');
 
     // Update (shallowly equal)
@@ -921,7 +1067,7 @@ describe('ReactLazy', () => {
         <LazyAdd outer={2} />
       </Suspense>,
     );
-    root.unstable_flushAll();
+    expect(Scheduler).toFlushWithoutYielding();
     expect(root).toMatchRenderedOutput('4');
 
     // Update
@@ -930,7 +1076,7 @@ describe('ReactLazy', () => {
         <LazyAdd outer={3} />
       </Suspense>,
     );
-    root.unstable_flushAll();
+    expect(Scheduler).toFlushWithoutYielding();
     expect(root).toMatchRenderedOutput('5');
 
     // Update (shallowly equal)
@@ -939,7 +1085,7 @@ describe('ReactLazy', () => {
         <LazyAdd outer={3} />
       </Suspense>,
     );
-    root.unstable_flushAll();
+    expect(Scheduler).toFlushWithoutYielding();
     expect(root).toMatchRenderedOutput('5');
 
     // Update (explicit props)
@@ -948,7 +1094,7 @@ describe('ReactLazy', () => {
         <LazyAdd outer={1} inner={1} />
       </Suspense>,
     );
-    root.unstable_flushAll();
+    expect(Scheduler).toFlushWithoutYielding();
     expect(root).toMatchRenderedOutput('2');
 
     // Update (explicit props, shallowly equal)
@@ -957,7 +1103,7 @@ describe('ReactLazy', () => {
         <LazyAdd outer={1} inner={1} />
       </Suspense>,
     );
-    root.unstable_flushAll();
+    expect(Scheduler).toFlushWithoutYielding();
     expect(root).toMatchRenderedOutput('2');
 
     // Update
@@ -966,7 +1112,7 @@ describe('ReactLazy', () => {
         <LazyAdd outer={1} />
       </Suspense>,
     );
-    root.unstable_flushAll();
+    expect(Scheduler).toFlushWithoutYielding();
     expect(root).toMatchRenderedOutput('3');
   });
 
@@ -991,12 +1137,12 @@ describe('ReactLazy', () => {
         unstable_isConcurrent: true,
       },
     );
-    expect(root).toFlushAndYield(['Loading...']);
-    expect(root).toMatchRenderedOutput(null);
+    expect(Scheduler).toFlushAndYield(['Loading...']);
+    expect(root).not.toMatchRenderedOutput('4');
 
     // Mount
     await Promise.resolve();
-    root.unstable_flushAll();
+    expect(Scheduler).toFlushWithoutYielding();
     expect(root).toMatchRenderedOutput('4');
 
     // Update
@@ -1005,7 +1151,7 @@ describe('ReactLazy', () => {
         <LazyAdd outer={3} />
       </Suspense>,
     );
-    root.unstable_flushAll();
+    expect(Scheduler).toFlushWithoutYielding();
     expect(root).toMatchRenderedOutput('5');
 
     // Update
@@ -1014,7 +1160,475 @@ describe('ReactLazy', () => {
         <LazyAdd />
       </Suspense>,
     );
-    root.unstable_flushAll();
+    expect(Scheduler).toFlushWithoutYielding();
     expect(root).toMatchRenderedOutput('2');
+  });
+
+  it('warns about ref on functions for lazy-loaded components', async () => {
+    const LazyFoo = lazy(() => {
+      const Foo = props => <div />;
+      return fakeImport(Foo);
+    });
+
+    const ref = React.createRef();
+    ReactTestRenderer.create(
+      <Suspense fallback={<Text text="Loading..." />}>
+        <LazyFoo ref={ref} />
+      </Suspense>,
+      {
+        unstable_isConcurrent: true,
+      },
+    );
+
+    expect(Scheduler).toFlushAndYield(['Loading...']);
+    await Promise.resolve();
+    expect(() => {
+      expect(Scheduler).toFlushAndYield([]);
+    }).toErrorDev('Function components cannot be given refs');
+  });
+
+  it('should error with a component stack naming the resolved component', async () => {
+    let componentStackMessage;
+
+    const LazyText = lazy(() =>
+      fakeImport(function ResolvedText() {
+        throw new Error('oh no');
+      }),
+    );
+
+    class ErrorBoundary extends React.Component {
+      state = {error: null};
+
+      componentDidCatch(error, errMessage) {
+        componentStackMessage = normalizeCodeLocInfo(errMessage.componentStack);
+        this.setState({
+          error,
+        });
+      }
+
+      render() {
+        return this.state.error ? null : this.props.children;
+      }
+    }
+
+    ReactTestRenderer.create(
+      <ErrorBoundary>
+        <Suspense fallback={<Text text="Loading..." />}>
+          <LazyText text="Hi" />
+        </Suspense>
+      </ErrorBoundary>,
+      {unstable_isConcurrent: true},
+    );
+
+    expect(Scheduler).toFlushAndYield(['Loading...']);
+
+    try {
+      await Promise.resolve();
+    } catch (e) {}
+
+    expect(Scheduler).toFlushAndYield([]);
+
+    expect(componentStackMessage).toContain('in ResolvedText');
+  });
+
+  it('should error with a component stack containing Lazy if unresolved', () => {
+    let componentStackMessage;
+
+    const LazyText = lazy(() => ({
+      then(resolve, reject) {
+        reject(new Error('oh no'));
+      },
+    }));
+
+    class ErrorBoundary extends React.Component {
+      state = {error: null};
+
+      componentDidCatch(error, errMessage) {
+        componentStackMessage = normalizeCodeLocInfo(errMessage.componentStack);
+        this.setState({
+          error,
+        });
+      }
+
+      render() {
+        return this.state.error ? null : this.props.children;
+      }
+    }
+
+    ReactTestRenderer.create(
+      <ErrorBoundary>
+        <Suspense fallback={<Text text="Loading..." />}>
+          <LazyText text="Hi" />
+        </Suspense>
+      </ErrorBoundary>,
+    );
+
+    expect(Scheduler).toHaveYielded([]);
+
+    expect(componentStackMessage).toContain('in Lazy');
+  });
+
+  // @gate enableLazyElements
+  it('mount and reorder lazy types', async () => {
+    class Child extends React.Component {
+      componentWillUnmount() {
+        Scheduler.unstable_yieldValue('Did unmount: ' + this.props.label);
+      }
+      componentDidMount() {
+        Scheduler.unstable_yieldValue('Did mount: ' + this.props.label);
+      }
+      componentDidUpdate() {
+        Scheduler.unstable_yieldValue('Did update: ' + this.props.label);
+      }
+      render() {
+        return <Text text={this.props.label} />;
+      }
+    }
+
+    function ChildA({lowerCase}) {
+      return <Child label={lowerCase ? 'a' : 'A'} />;
+    }
+
+    function ChildB({lowerCase}) {
+      return <Child label={lowerCase ? 'b' : 'B'} />;
+    }
+
+    const LazyChildA = lazy(() => {
+      Scheduler.unstable_yieldValue('Init A');
+      return fakeImport(ChildA);
+    });
+    const LazyChildB = lazy(() => {
+      Scheduler.unstable_yieldValue('Init B');
+      return fakeImport(ChildB);
+    });
+    const LazyChildA2 = lazy(() => {
+      Scheduler.unstable_yieldValue('Init A2');
+      return fakeImport(ChildA);
+    });
+    let resolveB2;
+    const LazyChildB2 = lazy(() => {
+      Scheduler.unstable_yieldValue('Init B2');
+      return new Promise(r => {
+        resolveB2 = r;
+      });
+    });
+
+    function Parent({swap}) {
+      return (
+        <Suspense fallback={<Text text="Outer..." />}>
+          <Suspense fallback={<Text text="Loading..." />}>
+            {swap
+              ? [
+                  <LazyChildB2 key="B" lowerCase={true} />,
+                  <LazyChildA2 key="A" lowerCase={true} />,
+                ]
+              : [<LazyChildA key="A" />, <LazyChildB key="B" />]}
+          </Suspense>
+        </Suspense>
+      );
+    }
+
+    const root = ReactTestRenderer.create(<Parent swap={false} />, {
+      unstable_isConcurrent: true,
+    });
+
+    expect(Scheduler).toFlushAndYield(['Init A', 'Init B', 'Loading...']);
+    expect(root).not.toMatchRenderedOutput('AB');
+
+    await LazyChildA;
+    await LazyChildB;
+
+    expect(Scheduler).toFlushAndYield([
+      'A',
+      'B',
+      'Did mount: A',
+      'Did mount: B',
+    ]);
+    expect(root).toMatchRenderedOutput('AB');
+
+    // Swap the position of A and B
+    root.update(<Parent swap={true} />);
+    expect(Scheduler).toFlushAndYield(['Init B2', 'Loading...']);
+    jest.runAllTimers();
+
+    gate(flags => {
+      if (flags.enableSuspenseLayoutEffectSemantics) {
+        expect(Scheduler).toHaveYielded(['Did unmount: A', 'Did unmount: B']);
+      }
+    });
+
+    // The suspense boundary should've triggered now.
+    expect(root).toMatchRenderedOutput('Loading...');
+    await resolveB2({default: ChildB});
+
+    // We need to flush to trigger the second one to load.
+    expect(Scheduler).toFlushAndYield(['Init A2']);
+    await LazyChildA2;
+
+    gate(flags => {
+      if (flags.enableSuspenseLayoutEffectSemantics) {
+        expect(Scheduler).toFlushAndYield([
+          'b',
+          'a',
+          'Did mount: b',
+          'Did mount: a',
+        ]);
+      } else {
+        expect(Scheduler).toFlushAndYield([
+          'b',
+          'a',
+          'Did update: b',
+          'Did update: a',
+        ]);
+      }
+    });
+    expect(root).toMatchRenderedOutput('ba');
+  });
+
+  // @gate enableLazyElements
+  it('mount and reorder lazy types (legacy mode)', async () => {
+    class Child extends React.Component {
+      componentDidMount() {
+        Scheduler.unstable_yieldValue('Did mount: ' + this.props.label);
+      }
+      componentDidUpdate() {
+        Scheduler.unstable_yieldValue('Did update: ' + this.props.label);
+      }
+      render() {
+        return <Text text={this.props.label} />;
+      }
+    }
+
+    function ChildA({lowerCase}) {
+      return <Child label={lowerCase ? 'a' : 'A'} />;
+    }
+
+    function ChildB({lowerCase}) {
+      return <Child label={lowerCase ? 'b' : 'B'} />;
+    }
+
+    const LazyChildA = lazy(() => {
+      Scheduler.unstable_yieldValue('Init A');
+      return fakeImport(ChildA);
+    });
+    const LazyChildB = lazy(() => {
+      Scheduler.unstable_yieldValue('Init B');
+      return fakeImport(ChildB);
+    });
+    const LazyChildA2 = lazy(() => {
+      Scheduler.unstable_yieldValue('Init A2');
+      return fakeImport(ChildA);
+    });
+    const LazyChildB2 = lazy(() => {
+      Scheduler.unstable_yieldValue('Init B2');
+      return fakeImport(ChildB);
+    });
+
+    function Parent({swap}) {
+      return (
+        <Suspense fallback={<Text text="Outer..." />}>
+          <Suspense fallback={<Text text="Loading..." />}>
+            {swap
+              ? [
+                  <LazyChildB2 key="B" lowerCase={true} />,
+                  <LazyChildA2 key="A" lowerCase={true} />,
+                ]
+              : [<LazyChildA key="A" />, <LazyChildB key="B" />]}
+          </Suspense>
+        </Suspense>
+      );
+    }
+
+    const root = ReactTestRenderer.create(<Parent swap={false} />, {
+      unstable_isConcurrent: false,
+    });
+
+    expect(Scheduler).toHaveYielded(['Init A', 'Init B', 'Loading...']);
+    expect(root).not.toMatchRenderedOutput('AB');
+
+    await LazyChildA;
+    await LazyChildB;
+
+    expect(Scheduler).toFlushAndYield([
+      'A',
+      'B',
+      'Did mount: A',
+      'Did mount: B',
+    ]);
+    expect(root).toMatchRenderedOutput('AB');
+
+    // Swap the position of A and B
+    root.update(<Parent swap={true} />);
+    expect(Scheduler).toHaveYielded(['Init B2', 'Loading...']);
+    await LazyChildB2;
+    // We need to flush to trigger the second one to load.
+    expect(Scheduler).toFlushAndYield(['Init A2']);
+    await LazyChildA2;
+
+    expect(Scheduler).toFlushAndYield([
+      'b',
+      'a',
+      'Did update: b',
+      'Did update: a',
+    ]);
+    expect(root).toMatchRenderedOutput('ba');
+  });
+
+  // @gate enableLazyElements
+  it('mount and reorder lazy elements', async () => {
+    class Child extends React.Component {
+      componentDidMount() {
+        Scheduler.unstable_yieldValue('Did mount: ' + this.props.label);
+      }
+      componentDidUpdate() {
+        Scheduler.unstable_yieldValue('Did update: ' + this.props.label);
+      }
+      render() {
+        return <Text text={this.props.label} />;
+      }
+    }
+
+    const lazyChildA = lazy(() => {
+      Scheduler.unstable_yieldValue('Init A');
+      return fakeImport(<Child key="A" label="A" />);
+    });
+    const lazyChildB = lazy(() => {
+      Scheduler.unstable_yieldValue('Init B');
+      return fakeImport(<Child key="B" label="B" />);
+    });
+    const lazyChildA2 = lazy(() => {
+      Scheduler.unstable_yieldValue('Init A2');
+      return fakeImport(<Child key="A" label="a" />);
+    });
+    const lazyChildB2 = lazy(() => {
+      Scheduler.unstable_yieldValue('Init B2');
+      return fakeImport(<Child key="B" label="b" />);
+    });
+
+    function Parent({swap}) {
+      return (
+        <Suspense fallback={<Text text="Loading..." />}>
+          {swap ? [lazyChildB2, lazyChildA2] : [lazyChildA, lazyChildB]}
+        </Suspense>
+      );
+    }
+
+    const root = ReactTestRenderer.create(<Parent swap={false} />, {
+      unstable_isConcurrent: true,
+    });
+
+    expect(Scheduler).toFlushAndYield(['Init A', 'Loading...']);
+    expect(root).not.toMatchRenderedOutput('AB');
+
+    await lazyChildA;
+    // We need to flush to trigger the B to load.
+    expect(Scheduler).toFlushAndYield(['Init B']);
+    await lazyChildB;
+
+    expect(Scheduler).toFlushAndYield([
+      'A',
+      'B',
+      'Did mount: A',
+      'Did mount: B',
+    ]);
+    expect(root).toMatchRenderedOutput('AB');
+
+    // Swap the position of A and B
+    if (gate(flags => flags.enableSyncDefaultUpdates)) {
+      React.startTransition(() => {
+        root.update(<Parent swap={true} />);
+      });
+    } else {
+      root.update(<Parent swap={true} />);
+    }
+    expect(Scheduler).toFlushAndYield(['Init B2', 'Loading...']);
+    await lazyChildB2;
+    // We need to flush to trigger the second one to load.
+    expect(Scheduler).toFlushAndYield(['Init A2', 'Loading...']);
+    await lazyChildA2;
+
+    expect(Scheduler).toFlushAndYield([
+      'b',
+      'a',
+      'Did update: b',
+      'Did update: a',
+    ]);
+    expect(root).toMatchRenderedOutput('ba');
+  });
+
+  // @gate enableLazyElements
+  it('mount and reorder lazy elements (legacy mode)', async () => {
+    class Child extends React.Component {
+      componentDidMount() {
+        Scheduler.unstable_yieldValue('Did mount: ' + this.props.label);
+      }
+      componentDidUpdate() {
+        Scheduler.unstable_yieldValue('Did update: ' + this.props.label);
+      }
+      render() {
+        return <Text text={this.props.label} />;
+      }
+    }
+
+    const lazyChildA = lazy(() => {
+      Scheduler.unstable_yieldValue('Init A');
+      return fakeImport(<Child key="A" label="A" />);
+    });
+    const lazyChildB = lazy(() => {
+      Scheduler.unstable_yieldValue('Init B');
+      return fakeImport(<Child key="B" label="B" />);
+    });
+    const lazyChildA2 = lazy(() => {
+      Scheduler.unstable_yieldValue('Init A2');
+      return fakeImport(<Child key="A" label="a" />);
+    });
+    const lazyChildB2 = lazy(() => {
+      Scheduler.unstable_yieldValue('Init B2');
+      return fakeImport(<Child key="B" label="b" />);
+    });
+
+    function Parent({swap}) {
+      return (
+        <Suspense fallback={<Text text="Loading..." />}>
+          {swap ? [lazyChildB2, lazyChildA2] : [lazyChildA, lazyChildB]}
+        </Suspense>
+      );
+    }
+
+    const root = ReactTestRenderer.create(<Parent swap={false} />, {
+      unstable_isConcurrent: false,
+    });
+
+    expect(Scheduler).toHaveYielded(['Init A', 'Loading...']);
+    expect(root).not.toMatchRenderedOutput('AB');
+
+    await lazyChildA;
+    // We need to flush to trigger the B to load.
+    expect(Scheduler).toFlushAndYield(['Init B']);
+    await lazyChildB;
+
+    expect(Scheduler).toFlushAndYield([
+      'A',
+      'B',
+      'Did mount: A',
+      'Did mount: B',
+    ]);
+    expect(root).toMatchRenderedOutput('AB');
+
+    // Swap the position of A and B
+    root.update(<Parent swap={true} />);
+    expect(Scheduler).toHaveYielded(['Init B2', 'Loading...']);
+    await lazyChildB2;
+    // We need to flush to trigger the second one to load.
+    expect(Scheduler).toFlushAndYield(['Init A2']);
+    await lazyChildA2;
+
+    expect(Scheduler).toFlushAndYield([
+      'b',
+      'a',
+      'Did update: b',
+      'Did update: a',
+    ]);
+    expect(root).toMatchRenderedOutput('ba');
   });
 });

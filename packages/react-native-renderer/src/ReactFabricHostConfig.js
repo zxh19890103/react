@@ -7,47 +7,56 @@
  * @flow
  */
 
+import type {ElementRef} from 'react';
 import type {
+  HostComponent,
   MeasureInWindowOnSuccessCallback,
   MeasureLayoutOnSuccessCallback,
   MeasureOnSuccessCallback,
-  NativeMethodsMixinType,
-  ReactNativeBaseComponentViewConfig,
+  NativeMethods,
+  ViewConfig,
+  TouchedViewDataAtPoint,
 } from './ReactNativeTypes';
 
-import {
-  mountSafeCallback_NOT_REALLY_SAFE,
-  warnForStyleProps,
-} from './NativeMethodsMixinUtils';
+import {mountSafeCallback_NOT_REALLY_SAFE} from './NativeMethodsMixinUtils';
 import {create, diff} from './ReactNativeAttributePayload';
-import {
-  now as ReactNativeFrameSchedulingNow,
-  cancelDeferredCallback as ReactNativeFrameSchedulingCancelDeferredCallback,
-  scheduleDeferredCallback as ReactNativeFrameSchedulingScheduleDeferredCallback,
-  shouldYield as ReactNativeFrameSchedulingShouldYield,
-} from './ReactNativeFrameScheduling';
-import {get as getViewConfigForType} from 'ReactNativeViewConfigRegistry';
 
-import deepFreezeAndThrowOnMutationInDev from 'deepFreezeAndThrowOnMutationInDev';
 import invariant from 'shared/invariant';
 
 import {dispatchEvent} from './ReactFabricEventEmitter';
 
-// Modules provided by RN:
-import TextInputState from 'TextInputState';
 import {
+  DefaultEventPriority,
+  DiscreteEventPriority,
+} from 'react-reconciler/src/ReactEventPriorities';
+
+// Modules provided by RN:
+import {
+  ReactNativeViewConfigRegistry,
+  TextInputState,
+  deepFreezeAndThrowOnMutationInDev,
+} from 'react-native/Libraries/ReactPrivate/ReactNativePrivateInterface';
+
+const {
   createNode,
   cloneNode,
   cloneNodeWithNewChildren,
   cloneNodeWithNewChildrenAndProps,
   cloneNodeWithNewProps,
-  createChildSet as createChildNodeSet,
-  appendChild as appendChildNode,
-  appendChildToSet as appendChildNodeToSet,
+  createChildSet: createChildNodeSet,
+  appendChild: appendChildNode,
+  appendChildToSet: appendChildNodeToSet,
   completeRoot,
   registerEventHandler,
-} from 'FabricUIManager';
-import UIManager from 'UIManager';
+  measure: fabricMeasure,
+  measureInWindow: fabricMeasureInWindow,
+  measureLayout: fabricMeasureLayout,
+  unstable_DefaultEventPriority: FabricDefaultPriority,
+  unstable_DiscreteEventPriority: FabricDiscretePriority,
+  unstable_getCurrentEventPriority: fabricGetCurrentEventPriority,
+} = nativeFabricUIManager;
+
+const {get: getViewConfigForType} = ReactNativeViewConfigRegistry;
 
 // Counter for uniquely identifying views.
 // % 10 === 1 means it is a rootTag.
@@ -61,10 +70,9 @@ export type Props = Object;
 export type Instance = {
   node: Node,
   canonical: ReactFabricHostComponent,
+  ...
 };
-export type TextInstance = {
-  node: Node,
-};
+export type TextInstance = {node: Node, ...};
 export type HydratableInstance = Instance | TextInstance;
 export type PublicInstance = ReactFabricHostComponent;
 export type Container = number;
@@ -76,6 +84,19 @@ export type UpdatePayload = Object;
 
 export type TimeoutHandle = TimeoutID;
 export type NoTimeout = -1;
+
+export type OpaqueIDType = void;
+
+export type RendererInspectionConfig = $ReadOnly<{|
+  // Deprecated. Replaced with getInspectorDataForViewAtPoint.
+  getInspectorDataForViewTag?: (tag: number) => Object,
+  getInspectorDataForViewAtPoint?: (
+    inspectedView: Object,
+    locationX: number,
+    locationY: number,
+    callback: (viewData: TouchedViewDataAtPoint) => mixed,
+  ) => void,
+|}>;
 
 // TODO: Remove this conditional once all changes have propagated.
 if (registerEventHandler) {
@@ -90,49 +111,65 @@ if (registerEventHandler) {
  */
 class ReactFabricHostComponent {
   _nativeTag: number;
-  viewConfig: ReactNativeBaseComponentViewConfig<>;
+  viewConfig: ViewConfig;
   currentProps: Props;
+  _internalInstanceHandle: Object;
 
   constructor(
     tag: number,
-    viewConfig: ReactNativeBaseComponentViewConfig<>,
+    viewConfig: ViewConfig,
     props: Props,
+    internalInstanceHandle: Object,
   ) {
     this._nativeTag = tag;
     this.viewConfig = viewConfig;
     this.currentProps = props;
+    this._internalInstanceHandle = internalInstanceHandle;
   }
 
   blur() {
-    TextInputState.blurTextInput(this._nativeTag);
+    TextInputState.blurTextInput(this);
   }
 
   focus() {
-    TextInputState.focusTextInput(this._nativeTag);
+    TextInputState.focusTextInput(this);
   }
 
   measure(callback: MeasureOnSuccessCallback) {
-    UIManager.measure(
-      this._nativeTag,
+    fabricMeasure(
+      this._internalInstanceHandle.stateNode.node,
       mountSafeCallback_NOT_REALLY_SAFE(this, callback),
     );
   }
 
   measureInWindow(callback: MeasureInWindowOnSuccessCallback) {
-    UIManager.measureInWindow(
-      this._nativeTag,
+    fabricMeasureInWindow(
+      this._internalInstanceHandle.stateNode.node,
       mountSafeCallback_NOT_REALLY_SAFE(this, callback),
     );
   }
 
   measureLayout(
-    relativeToNativeNode: number,
+    relativeToNativeNode: number | ElementRef<HostComponent<mixed>>,
     onSuccess: MeasureLayoutOnSuccessCallback,
-    onFail: () => void /* currently unused */,
+    onFail?: () => void /* currently unused */,
   ) {
-    UIManager.measureLayout(
-      this._nativeTag,
-      relativeToNativeNode,
+    if (
+      typeof relativeToNativeNode === 'number' ||
+      !(relativeToNativeNode instanceof ReactFabricHostComponent)
+    ) {
+      if (__DEV__) {
+        console.error(
+          'Warning: ref.measureLayout must be called with a ref to a native component.',
+        );
+      }
+
+      return;
+    }
+
+    fabricMeasureLayout(
+      this._internalInstanceHandle.stateNode.node,
+      relativeToNativeNode._internalInstanceHandle.stateNode.node,
       mountSafeCallback_NOT_REALLY_SAFE(this, onFail),
       mountSafeCallback_NOT_REALLY_SAFE(this, onSuccess),
     );
@@ -140,29 +177,23 @@ class ReactFabricHostComponent {
 
   setNativeProps(nativeProps: Object) {
     if (__DEV__) {
-      warnForStyleProps(nativeProps, this.viewConfig.validAttributes);
-    }
-
-    const updatePayload = create(nativeProps, this.viewConfig.validAttributes);
-
-    // Avoid the overhead of bridge calls if there's no update.
-    // This is an expensive no-op for Android, and causes an unnecessary
-    // view invalidation for certain components (eg RCTTextInput) on iOS.
-    if (updatePayload != null) {
-      UIManager.updateView(
-        this._nativeTag,
-        this.viewConfig.uiViewClassName,
-        updatePayload,
+      console.error(
+        'Warning: setNativeProps is not currently supported in Fabric',
       );
     }
+
+    return;
   }
 }
 
 // eslint-disable-next-line no-unused-expressions
-(ReactFabricHostComponent.prototype: NativeMethodsMixinType);
+(ReactFabricHostComponent.prototype: $ReadOnly<{...NativeMethods, ...}>);
 
-export * from 'shared/HostConfigWithNoMutation';
-export * from 'shared/HostConfigWithNoHydration';
+export * from 'react-reconciler/src/ReactFiberHostConfigWithNoMutation';
+export * from 'react-reconciler/src/ReactFiberHostConfigWithNoHydration';
+export * from 'react-reconciler/src/ReactFiberHostConfigWithNoScopes';
+export * from 'react-reconciler/src/ReactFiberHostConfigWithNoTestSelectors';
+export * from 'react-reconciler/src/ReactFiberHostConfigWithNoMicrotasks';
 
 export function appendInitialChild(
   parentInstance: Instance,
@@ -191,11 +222,6 @@ export function createInstance(
     }
   }
 
-  invariant(
-    type !== 'RCTView' || !hostContext.isInAParentText,
-    'Nesting of <View> within <Text> is not currently supported.',
-  );
-
   const updatePayload = create(props, viewConfig.validAttributes);
 
   const node = createNode(
@@ -206,7 +232,12 @@ export function createInstance(
     internalInstanceHandle, // internalInstanceHandle
   );
 
-  const component = new ReactFabricHostComponent(tag, viewConfig, props);
+  const component = new ReactFabricHostComponent(
+    tag,
+    viewConfig,
+    props,
+    internalInstanceHandle,
+  );
 
   return {
     node: node,
@@ -281,8 +312,9 @@ export function getPublicInstance(instance: Instance): * {
   return instance.canonical;
 }
 
-export function prepareForCommit(containerInfo: Container): void {
+export function prepareForCommit(containerInfo: Container): null | Object {
   // Noop
+  return null;
 }
 
 export function prepareUpdate(
@@ -306,10 +338,6 @@ export function resetAfterCommit(containerInfo: Container): void {
   // Noop
 }
 
-export function shouldDeprioritizeSubtree(type: string, props: Props): boolean {
-  return false;
-}
-
 export function shouldSetTextContent(type: string, props: Props): boolean {
   // TODO (bvaughn) Revisit this decision.
   // Always returning false simplifies the createInstance() implementation,
@@ -320,12 +348,29 @@ export function shouldSetTextContent(type: string, props: Props): boolean {
   return false;
 }
 
+export function getCurrentEventPriority(): * {
+  const currentEventPriority = fabricGetCurrentEventPriority
+    ? fabricGetCurrentEventPriority()
+    : null;
+
+  if (currentEventPriority != null) {
+    switch (currentEventPriority) {
+      case FabricDiscretePriority:
+        return DiscreteEventPriority;
+      case FabricDefaultPriority:
+      default:
+        return DefaultEventPriority;
+    }
+  }
+
+  return DefaultEventPriority;
+}
+
 // The Fabric renderer is secondary to the existing React Native renderer.
 export const isPrimaryRenderer = false;
-export const now = ReactNativeFrameSchedulingNow;
-export const scheduleDeferredCallback = ReactNativeFrameSchedulingScheduleDeferredCallback;
-export const cancelDeferredCallback = ReactNativeFrameSchedulingCancelDeferredCallback;
-export const shouldYield = ReactNativeFrameSchedulingShouldYield;
+
+// The Fabric renderer shouldn't trigger missing act() warnings
+export const warnsIfNotActing = false;
 
 export const scheduleTimeout = setTimeout;
 export const cancelTimeout = clearTimeout;
@@ -386,29 +431,9 @@ export function cloneHiddenInstance(
   };
 }
 
-export function cloneUnhiddenInstance(
+export function cloneHiddenTextInstance(
   instance: Instance,
-  type: string,
-  props: Props,
-  internalInstanceHandle: Object,
-): Instance {
-  const viewConfig = instance.canonical.viewConfig;
-  const node = instance.node;
-  const updatePayload = diff(
-    {...props, style: [props.style, {display: 'none'}]},
-    props,
-    viewConfig.validAttributes,
-  );
-  return {
-    node: cloneNodeWithNewProps(node, updatePayload),
-    canonical: instance.canonical,
-  };
-}
-
-export function createHiddenTextInstance(
   text: string,
-  rootContainerInstance: Container,
-  hostContext: HostContext,
   internalInstanceHandle: Object,
 ): TextInstance {
   throw new Error('Not yet implemented.');
@@ -436,3 +461,41 @@ export function replaceContainerChildren(
   container: Container,
   newChildren: ChildSet,
 ): void {}
+
+export function getInstanceFromNode(node: any) {
+  throw new Error('Not yet implemented.');
+}
+
+export function isOpaqueHydratingObject(value: mixed): boolean {
+  throw new Error('Not yet implemented');
+}
+
+export function makeOpaqueHydratingObject(
+  attemptToReadValue: () => void,
+): OpaqueIDType {
+  throw new Error('Not yet implemented.');
+}
+
+export function makeClientId(): OpaqueIDType {
+  throw new Error('Not yet implemented');
+}
+
+export function makeClientIdInDEV(warnOnAccessInDEV: () => void): OpaqueIDType {
+  throw new Error('Not yet implemented');
+}
+
+export function beforeActiveInstanceBlur(internalInstanceHandle: Object) {
+  // noop
+}
+
+export function afterActiveInstanceBlur() {
+  // noop
+}
+
+export function preparePortalMount(portalInstance: Instance): void {
+  // noop
+}
+
+export function detachDeletedInstance(node: Instance): void {
+  // noop
+}

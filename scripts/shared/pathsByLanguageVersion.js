@@ -10,9 +10,12 @@
 const esNextPaths = [
   // Internal forwarding modules
   'packages/*/*.js',
+  'packages/*/esm/*.js',
   // Source files
   'packages/*/src/**/*.js',
-  'packages/events/**/*.js',
+  'packages/dom-event-testing-library/**/*.js',
+  'packages/react-interactions/**/*.js',
+  'packages/react-interactions/**/*.js',
   'packages/shared/**/*.js',
   // Shims and Flow environment
   'scripts/flow/*.js',

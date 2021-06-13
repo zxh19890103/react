@@ -10,9 +10,10 @@
 
 'use strict';
 
-import type {ViewConfigGetter} from './ReactNativeTypes';
+import {ReactNativeViewConfigRegistry} from 'react-native/Libraries/ReactPrivate/ReactNativePrivateInterface';
+import {type ViewConfig} from './ReactNativeTypes';
 
-const {register} = require('ReactNativeViewConfigRegistry');
+const {register} = ReactNativeViewConfigRegistry;
 
 /**
  * Creates a renderable ReactNative host component.
@@ -24,7 +25,7 @@ const {register} = require('ReactNativeViewConfigRegistry');
  */
 const createReactNativeComponentClass = function(
   name: string,
-  callback: ViewConfigGetter,
+  callback: () => ViewConfig,
 ): string {
   return register(name, callback);
 };

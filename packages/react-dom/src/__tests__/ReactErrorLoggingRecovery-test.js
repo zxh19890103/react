@@ -39,10 +39,17 @@ class Bad extends React.Component {
 }
 
 describe('ReactErrorLoggingRecovery', () => {
-  let originalConsoleError = console.error;
+  const originalConsoleError = console.error;
 
   beforeEach(() => {
     console.error = error => {
+      if (
+        typeof error === 'string' &&
+        error.includes('ReactDOM.render is no longer supported in React 18')
+      ) {
+        // Ignore legacy root deprecation warning
+        return;
+      }
       throw new Error('Buggy console.error');
     };
   });

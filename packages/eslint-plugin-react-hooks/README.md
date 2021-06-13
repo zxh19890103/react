@@ -2,29 +2,36 @@
 
 This ESLint plugin enforces the [Rules of Hooks](https://reactjs.org/docs/hooks-rules.html).
 
-It is a part of the [Hooks proposal](https://reactjs.org/docs/hooks-intro.html) for React.
-
-## Experimental Status
-
-This is an experimental release and is intended to be used for testing the Hooks proposal with React 16.7 alpha. The exact heuristics it uses may be adjusted.
-
-The [Rules of Hooks](https://reactjs.org/docs/hooks-rules.html) documentation contains a link to the technical RFC. Please leave a comment on the RFC if you have concerns or ideas about how this plugin should work.
+It is a part of the [Hooks API](https://reactjs.org/docs/hooks-intro.html) for React.
 
 ## Installation
 
-**Note: If you're using Create React App, please wait for a corresponding experimental release of `react-scripts` that includes this rule instead of adding it directly.**
+**Note: If you're using Create React App, please use `react-scripts` >= 3 instead of adding it directly.**
 
 Assuming you already have ESLint installed, run:
 
 ```sh
 # npm
-npm install eslint-plugin-react-hooks@next --save-dev
+npm install eslint-plugin-react-hooks --save-dev
 
 # yarn
-yarn add eslint-plugin-react-hooks@next --dev
+yarn add eslint-plugin-react-hooks --dev
 ```
 
-Then add it to your ESLint configuration:
+Then extend the recommended eslint config:
+
+```js
+{
+  "extends": [
+    // ...
+    "plugin:react-hooks/recommended"
+  ]
+}
+```
+
+### Custom Configuration
+
+If you want more fine-grained configuration, you can instead add a snippet like this to your ESLint configuration file:
 
 ```js
 {
@@ -34,10 +41,30 @@ Then add it to your ESLint configuration:
   ],
   "rules": {
     // ...
-    "react-hooks/rules-of-hooks": "error"
+    "react-hooks/rules-of-hooks": "error",
+    "react-hooks/exhaustive-deps": "warn"
   }
 }
 ```
+
+
+## Advanced Configuration
+
+`exhaustive-deps` can be configured to validate dependencies of custom Hooks with the `additionalHooks` option.
+This option accepts a regex to match the names of custom Hooks that have dependencies.
+
+```js
+{
+  "rules": {
+    // ...
+    "react-hooks/exhaustive-deps": ["warn", {
+      "additionalHooks": "(useMyCustomHook|useMyOtherCustomHook)"
+    }]
+  }
+}
+```
+
+We suggest to use this option **very sparingly, if at all**. Generally saying, we recommend most custom Hooks to not use the dependencies argument, and instead provide a higher-level API that is more focused around a specific use case.
 
 ## Valid and Invalid Examples
 

@@ -7,116 +7,57 @@
  * @flow
  */
 
-import type {AnyNativeEvent} from 'events/PluginModuleType';
-import type {Fiber} from 'react-reconciler/src/ReactFiber';
-import type {DOMTopLevelEventType} from 'events/TopLevelEventTypes';
+import type {AnyNativeEvent} from '../events/PluginModuleType';
+import type {FiberRoot} from 'react-reconciler/src/ReactInternalTypes';
+import type {Container, SuspenseInstance} from '../client/ReactDOMHostConfig';
+import type {DOMEventName} from '../events/DOMEventNames';
 
-import {batchedUpdates, interactiveUpdates} from 'events/ReactGenericBatching';
-import {runExtractedEventsInBatch} from 'events/EventPluginHub';
-import {isFiberMounted} from 'react-reconciler/reflection';
-import {HostRoot} from 'shared/ReactWorkTags';
+import {
+  isReplayableDiscreteEvent,
+  queueDiscreteEvent,
+  hasQueuedDiscreteEvents,
+  clearIfContinuousEvent,
+  queueIfContinuousEvent,
+} from './ReactDOMEventReplaying';
+import {
+  getNearestMountedFiber,
+  getContainerFromFiber,
+  getSuspenseInstanceFromFiber,
+} from 'react-reconciler/src/ReactFiberTreeReflection';
+import {HostRoot, SuspenseComponent} from 'react-reconciler/src/ReactWorkTags';
+import {type EventSystemFlags, IS_CAPTURE_PHASE} from './EventSystemFlags';
 
-import {addEventBubbleListener, addEventCaptureListener} from './EventListener';
 import getEventTarget from './getEventTarget';
 import {getClosestInstanceFromNode} from '../client/ReactDOMComponentTree';
-import SimpleEventPlugin from './SimpleEventPlugin';
-import {getRawEventName} from './DOMTopLevelEventTypes';
 
-const {isInteractiveTopLevelEventType} = SimpleEventPlugin;
+import {dispatchEventForPluginEventSystem} from './DOMPluginEventSystem';
+import {discreteUpdates} from './ReactDOMUpdateBatching';
 
-const CALLBACK_BOOKKEEPING_POOL_SIZE = 10;
-const callbackBookkeepingPool = [];
+import {
+  getCurrentPriorityLevel as getCurrentSchedulerPriorityLevel,
+  IdlePriority as IdleSchedulerPriority,
+  ImmediatePriority as ImmediateSchedulerPriority,
+  LowPriority as LowSchedulerPriority,
+  NormalPriority as NormalSchedulerPriority,
+  UserBlockingPriority as UserBlockingSchedulerPriority,
+} from 'react-reconciler/src/Scheduler';
+import {
+  DiscreteEventPriority,
+  ContinuousEventPriority,
+  DefaultEventPriority,
+  IdleEventPriority,
+  getCurrentUpdatePriority,
+  setCurrentUpdatePriority,
+} from 'react-reconciler/src/ReactEventPriorities';
+import ReactSharedInternals from 'shared/ReactSharedInternals';
 
-/**
- * Find the deepest React component completely containing the root of the
- * passed-in instance (for use when entire React trees are nested within each
- * other). If React trees are not nested, returns null.
- */
-function findRootContainerNode(inst) {
-  // TODO: It may be a good idea to cache this to prevent unnecessary DOM
-  // traversal, but caching is difficult to do correctly without using a
-  // mutation observer to listen for all DOM changes.
-  while (inst.return) {
-    inst = inst.return;
-  }
-  if (inst.tag !== HostRoot) {
-    // This can happen if we're in a detached tree.
-    return null;
-  }
-  return inst.stateNode.containerInfo;
-}
-
-// Used to store ancestor hierarchy in top level callback
-function getTopLevelCallbackBookKeeping(
-  topLevelType,
-  nativeEvent,
-  targetInst,
-): {
-  topLevelType: ?DOMTopLevelEventType,
-  nativeEvent: ?AnyNativeEvent,
-  targetInst: Fiber | null,
-  ancestors: Array<Fiber>,
-} {
-  if (callbackBookkeepingPool.length) {
-    const instance = callbackBookkeepingPool.pop();
-    instance.topLevelType = topLevelType;
-    instance.nativeEvent = nativeEvent;
-    instance.targetInst = targetInst;
-    return instance;
-  }
-  return {
-    topLevelType,
-    nativeEvent,
-    targetInst,
-    ancestors: [],
-  };
-}
-
-function releaseTopLevelCallbackBookKeeping(instance) {
-  instance.topLevelType = null;
-  instance.nativeEvent = null;
-  instance.targetInst = null;
-  instance.ancestors.length = 0;
-  if (callbackBookkeepingPool.length < CALLBACK_BOOKKEEPING_POOL_SIZE) {
-    callbackBookkeepingPool.push(instance);
-  }
-}
-
-function handleTopLevel(bookKeeping) {
-  let targetInst = bookKeeping.targetInst;
-
-  // Loop through the hierarchy, in case there's any nested components.
-  // It's important that we build the array of ancestors before calling any
-  // event handlers, because event handlers can modify the DOM, leading to
-  // inconsistencies with ReactMount's node cache. See #1105.
-  let ancestor = targetInst;
-  do {
-    if (!ancestor) {
-      bookKeeping.ancestors.push(ancestor);
-      break;
-    }
-    const root = findRootContainerNode(ancestor);
-    if (!root) {
-      break;
-    }
-    bookKeeping.ancestors.push(ancestor);
-    ancestor = getClosestInstanceFromNode(root);
-  } while (ancestor);
-
-  for (let i = 0; i < bookKeeping.ancestors.length; i++) {
-    targetInst = bookKeeping.ancestors[i];
-    runExtractedEventsInBatch(
-      bookKeeping.topLevelType,
-      targetInst,
-      bookKeeping.nativeEvent,
-      getEventTarget(bookKeeping.nativeEvent),
-    );
-  }
-}
+const {ReactCurrentBatchConfig} = ReactSharedInternals;
 
 // TODO: can we stop exporting these?
 export let _enabled = true;
 
+// This is exported in FB builds for use by legacy FB layer infra.
+// We'd like to remove this but it's not clear if this is safe.
 export function setEnabled(enabled: ?boolean) {
   _enabled = !!enabled;
 }
@@ -125,99 +66,331 @@ export function isEnabled() {
   return _enabled;
 }
 
-/**
- * Traps top-level events by using event bubbling.
- *
- * @param {number} topLevelType Number from `TopLevelEventTypes`.
- * @param {object} element Element on which to attach listener.
- * @return {?object} An object with a remove function which will forcefully
- *                  remove the listener.
- * @internal
- */
-export function trapBubbledEvent(
-  topLevelType: DOMTopLevelEventType,
-  element: Document | Element,
-) {
-  if (!element) {
-    return null;
-  }
-  const dispatch = isInteractiveTopLevelEventType(topLevelType)
-    ? dispatchInteractiveEvent
-    : dispatchEvent;
-
-  addEventBubbleListener(
-    element,
-    getRawEventName(topLevelType),
-    // Check if interactive and wrap in interactiveUpdates
-    dispatch.bind(null, topLevelType),
+export function createEventListenerWrapper(
+  targetContainer: EventTarget,
+  domEventName: DOMEventName,
+  eventSystemFlags: EventSystemFlags,
+): Function {
+  return dispatchEvent.bind(
+    null,
+    domEventName,
+    eventSystemFlags,
+    targetContainer,
   );
 }
 
-/**
- * Traps a top-level event by using event capturing.
- *
- * @param {number} topLevelType Number from `TopLevelEventTypes`.
- * @param {object} element Element on which to attach listener.
- * @return {?object} An object with a remove function which will forcefully
- *                  remove the listener.
- * @internal
- */
-export function trapCapturedEvent(
-  topLevelType: DOMTopLevelEventType,
-  element: Document | Element,
-) {
-  if (!element) {
-    return null;
+export function createEventListenerWrapperWithPriority(
+  targetContainer: EventTarget,
+  domEventName: DOMEventName,
+  eventSystemFlags: EventSystemFlags,
+): Function {
+  const eventPriority = getEventPriority(domEventName);
+  let listenerWrapper;
+  switch (eventPriority) {
+    case DiscreteEventPriority:
+      listenerWrapper = dispatchDiscreteEvent;
+      break;
+    case ContinuousEventPriority:
+      listenerWrapper = dispatchContinuousEvent;
+      break;
+    case DefaultEventPriority:
+    default:
+      listenerWrapper = dispatchEvent;
+      break;
   }
-  const dispatch = isInteractiveTopLevelEventType(topLevelType)
-    ? dispatchInteractiveEvent
-    : dispatchEvent;
-
-  addEventCaptureListener(
-    element,
-    getRawEventName(topLevelType),
-    // Check if interactive and wrap in interactiveUpdates
-    dispatch.bind(null, topLevelType),
+  return listenerWrapper.bind(
+    null,
+    domEventName,
+    eventSystemFlags,
+    targetContainer,
   );
 }
 
-function dispatchInteractiveEvent(topLevelType, nativeEvent) {
-  interactiveUpdates(dispatchEvent, topLevelType, nativeEvent);
+function dispatchDiscreteEvent(
+  domEventName,
+  eventSystemFlags,
+  container,
+  nativeEvent,
+) {
+  discreteUpdates(
+    dispatchEvent,
+    domEventName,
+    eventSystemFlags,
+    container,
+    nativeEvent,
+  );
+}
+
+function dispatchContinuousEvent(
+  domEventName,
+  eventSystemFlags,
+  container,
+  nativeEvent,
+) {
+  const previousPriority = getCurrentUpdatePriority();
+  const prevTransition = ReactCurrentBatchConfig.transition;
+  ReactCurrentBatchConfig.transition = 0;
+  try {
+    setCurrentUpdatePriority(ContinuousEventPriority);
+    dispatchEvent(domEventName, eventSystemFlags, container, nativeEvent);
+  } finally {
+    setCurrentUpdatePriority(previousPriority);
+    ReactCurrentBatchConfig.transition = prevTransition;
+  }
 }
 
 export function dispatchEvent(
-  topLevelType: DOMTopLevelEventType,
+  domEventName: DOMEventName,
+  eventSystemFlags: EventSystemFlags,
+  targetContainer: EventTarget,
   nativeEvent: AnyNativeEvent,
-) {
+): void {
   if (!_enabled) {
     return;
   }
 
-  const nativeEventTarget = getEventTarget(nativeEvent);
-  let targetInst = getClosestInstanceFromNode(nativeEventTarget);
+  // TODO: replaying capture phase events is currently broken
+  // because we used to do it during top-level native bubble handlers
+  // but now we use different bubble and capture handlers.
+  // In eager mode, we attach capture listeners early, so we need
+  // to filter them out until we fix the logic to handle them correctly.
+  const allowReplay = (eventSystemFlags & IS_CAPTURE_PHASE) === 0;
+
   if (
-    targetInst !== null &&
-    typeof targetInst.tag === 'number' &&
-    !isFiberMounted(targetInst)
+    allowReplay &&
+    hasQueuedDiscreteEvents() &&
+    isReplayableDiscreteEvent(domEventName)
   ) {
-    // If we get an event (ex: img onload) before committing that
-    // component's mount, ignore it for now (that is, treat it as if it was an
-    // event on a non-React tree). We might also consider queueing events and
-    // dispatching them after the mount.
-    targetInst = null;
+    // If we already have a queue of discrete events, and this is another discrete
+    // event, then we can't dispatch it regardless of its target, since they
+    // need to dispatch in order.
+    queueDiscreteEvent(
+      null, // Flags that we're not actually blocked on anything as far as we know.
+      domEventName,
+      eventSystemFlags,
+      targetContainer,
+      nativeEvent,
+    );
+    return;
   }
 
-  const bookKeeping = getTopLevelCallbackBookKeeping(
-    topLevelType,
+  const blockedOn = attemptToDispatchEvent(
+    domEventName,
+    eventSystemFlags,
+    targetContainer,
     nativeEvent,
-    targetInst,
   );
 
-  try {
-    // Event queue being processed in the same cycle allows
-    // `preventDefault`.
-    batchedUpdates(handleTopLevel, bookKeeping);
-  } finally {
-    releaseTopLevelCallbackBookKeeping(bookKeeping);
+  if (blockedOn === null) {
+    // We successfully dispatched this event.
+    if (allowReplay) {
+      clearIfContinuousEvent(domEventName, nativeEvent);
+    }
+    return;
+  }
+
+  if (allowReplay) {
+    if (isReplayableDiscreteEvent(domEventName)) {
+      // This this to be replayed later once the target is available.
+      queueDiscreteEvent(
+        blockedOn,
+        domEventName,
+        eventSystemFlags,
+        targetContainer,
+        nativeEvent,
+      );
+      return;
+    }
+    if (
+      queueIfContinuousEvent(
+        blockedOn,
+        domEventName,
+        eventSystemFlags,
+        targetContainer,
+        nativeEvent,
+      )
+    ) {
+      return;
+    }
+    // We need to clear only if we didn't queue because
+    // queueing is accumulative.
+    clearIfContinuousEvent(domEventName, nativeEvent);
+  }
+
+  // This is not replayable so we'll invoke it but without a target,
+  // in case the event system needs to trace it.
+  dispatchEventForPluginEventSystem(
+    domEventName,
+    eventSystemFlags,
+    nativeEvent,
+    null,
+    targetContainer,
+  );
+}
+
+// Attempt dispatching an event. Returns a SuspenseInstance or Container if it's blocked.
+export function attemptToDispatchEvent(
+  domEventName: DOMEventName,
+  eventSystemFlags: EventSystemFlags,
+  targetContainer: EventTarget,
+  nativeEvent: AnyNativeEvent,
+): null | Container | SuspenseInstance {
+  // TODO: Warn if _enabled is false.
+
+  const nativeEventTarget = getEventTarget(nativeEvent);
+  let targetInst = getClosestInstanceFromNode(nativeEventTarget);
+
+  if (targetInst !== null) {
+    const nearestMounted = getNearestMountedFiber(targetInst);
+    if (nearestMounted === null) {
+      // This tree has been unmounted already. Dispatch without a target.
+      targetInst = null;
+    } else {
+      const tag = nearestMounted.tag;
+      if (tag === SuspenseComponent) {
+        const instance = getSuspenseInstanceFromFiber(nearestMounted);
+        if (instance !== null) {
+          // Queue the event to be replayed later. Abort dispatching since we
+          // don't want this event dispatched twice through the event system.
+          // TODO: If this is the first discrete event in the queue. Schedule an increased
+          // priority for this boundary.
+          return instance;
+        }
+        // This shouldn't happen, something went wrong but to avoid blocking
+        // the whole system, dispatch the event without a target.
+        // TODO: Warn.
+        targetInst = null;
+      } else if (tag === HostRoot) {
+        const root: FiberRoot = nearestMounted.stateNode;
+        if (root.hydrate) {
+          // If this happens during a replay something went wrong and it might block
+          // the whole system.
+          return getContainerFromFiber(nearestMounted);
+        }
+        targetInst = null;
+      } else if (nearestMounted !== targetInst) {
+        // If we get an event (ex: img onload) before committing that
+        // component's mount, ignore it for now (that is, treat it as if it was an
+        // event on a non-React tree). We might also consider queueing events and
+        // dispatching them after the mount.
+        targetInst = null;
+      }
+    }
+  }
+  dispatchEventForPluginEventSystem(
+    domEventName,
+    eventSystemFlags,
+    nativeEvent,
+    targetInst,
+    targetContainer,
+  );
+  // We're not blocked on anything.
+  return null;
+}
+
+export function getEventPriority(domEventName: DOMEventName): * {
+  switch (domEventName) {
+    // Used by SimpleEventPlugin:
+    case 'cancel':
+    case 'click':
+    case 'close':
+    case 'contextmenu':
+    case 'copy':
+    case 'cut':
+    case 'auxclick':
+    case 'dblclick':
+    case 'dragend':
+    case 'dragstart':
+    case 'drop':
+    case 'focusin':
+    case 'focusout':
+    case 'input':
+    case 'invalid':
+    case 'keydown':
+    case 'keypress':
+    case 'keyup':
+    case 'mousedown':
+    case 'mouseup':
+    case 'paste':
+    case 'pause':
+    case 'play':
+    case 'pointercancel':
+    case 'pointerdown':
+    case 'pointerup':
+    case 'ratechange':
+    case 'reset':
+    case 'seeked':
+    case 'submit':
+    case 'touchcancel':
+    case 'touchend':
+    case 'touchstart':
+    case 'volumechange':
+    // Used by polyfills:
+    // eslint-disable-next-line no-fallthrough
+    case 'change':
+    case 'selectionchange':
+    case 'textInput':
+    case 'compositionstart':
+    case 'compositionend':
+    case 'compositionupdate':
+    // Only enableCreateEventHandleAPI:
+    // eslint-disable-next-line no-fallthrough
+    case 'beforeblur':
+    case 'afterblur':
+    // Not used by React but could be by user code:
+    // eslint-disable-next-line no-fallthrough
+    case 'beforeinput':
+    case 'blur':
+    case 'fullscreenchange':
+    case 'focus':
+    case 'hashchange':
+    case 'popstate':
+    case 'select':
+    case 'selectstart':
+      return DiscreteEventPriority;
+    case 'drag':
+    case 'dragenter':
+    case 'dragexit':
+    case 'dragleave':
+    case 'dragover':
+    case 'mousemove':
+    case 'mouseout':
+    case 'mouseover':
+    case 'pointermove':
+    case 'pointerout':
+    case 'pointerover':
+    case 'scroll':
+    case 'toggle':
+    case 'touchmove':
+    case 'wheel':
+    // Not used by React but could be by user code:
+    // eslint-disable-next-line no-fallthrough
+    case 'mouseenter':
+    case 'mouseleave':
+    case 'pointerenter':
+    case 'pointerleave':
+      return ContinuousEventPriority;
+    case 'message': {
+      // We might be in the Scheduler callback.
+      // Eventually this mechanism will be replaced by a check
+      // of the current priority on the native scheduler.
+      const schedulerPriority = getCurrentSchedulerPriorityLevel();
+      switch (schedulerPriority) {
+        case ImmediateSchedulerPriority:
+          return DiscreteEventPriority;
+        case UserBlockingSchedulerPriority:
+          return ContinuousEventPriority;
+        case NormalSchedulerPriority:
+        case LowSchedulerPriority:
+          // TODO: Handle LowSchedulerPriority, somehow. Maybe the same lane as hydration.
+          return DefaultEventPriority;
+        case IdleSchedulerPriority:
+          return IdleEventPriority;
+        default:
+          return DefaultEventPriority;
+      }
+    }
+    default:
+      return DefaultEventPriority;
   }
 }
